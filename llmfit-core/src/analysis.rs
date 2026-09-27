@@ -484,3 +484,255 @@ mod sanitization_gate_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_low_precision_pipeline_tests {
+    use super::*;
+    use crate::benchmarks::{MeasuredSource, MeasuredTps};
+    use crate::fit::{FitLevel, InferenceRuntime, ModelFit, NATIVE_LOW_PRECISION_SCORE_PENALTY};
+    use crate::hardware::GpuBackend;
+    use crate::models::{LlmModel, ModelFormat};
+
+    fn specs(gpu_name: &str, vram: f64) -> SystemSpecs {
+        SystemSpecs {
+            total_ram_gb: 128.0,
+            available_ram_gb: 96.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(vram),
+            total_gpu_vram_gb: Some(vram),
+            gpu_available_gb: None,
+            gpu_name: Some(gpu_name.to_string()),
+            gpu_count: 1,
+            unified_memory: false,
+            backend: GpuBackend::Cuda,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
+    fn model(name: &str, quant: &str, format: ModelFormat) -> LlmModel {
+        LlmModel {
+            name: name.to_string(),
+            provider: "test".to_string(),
+            parameter_count: "8B".to_string(),
+            parameters_raw: Some(8_000_000_000),
+            min_ram_gb: 5.0,
+            recommended_ram_gb: 10.0,
+            min_vram_gb: Some(5.0),
+            quantization: quant.to_string(),
+            context_length: 4096,
+            use_case: "General".to_string(),
+            is_moe: false,
+            num_experts: None,
+            active_experts: None,
+            active_parameters: None,
+            release_date: None,
+            gguf_sources: vec![],
+            capabilities: vec![],
+            languages: vec![],
+            format,
+            num_attention_heads: None,
+            num_key_value_heads: None,
+            num_hidden_layers: None,
+            head_dim: None,
+            attention_layout: None,
+            hidden_size: None,
+            moe_intermediate_size: None,
+            vocab_size: None,
+            shared_expert_intermediate_size: None,
+            architecture: Some("qwen3".to_string()),
+            license: None,
+        }
+    }
+
+    fn native_notes(fit: &ModelFit) -> Vec<&str> {
+        fit.notes
+            .iter()
+            .filter(|note| {
+                note.contains("native support") || note.contains("hardware prerequisite")
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn nvfp4() -> LlmModel {
+        model(
+            "TelperionAI/Qwen3.8-27B-NVFP4-AWQ-AutoRound",
+            "AWQ-4bit",
+            ModelFormat::Awq,
+        )
+    }
+
+    fn q8() -> LlmModel {
+        model("acme/Qwen3-8B-GGUF", "Q8_0", ModelFormat::Gguf)
+    }
+
+    fn plain_awq() -> LlmModel {
+        model("acme/Qwen3-8B-AWQ", "AWQ-4bit", ModelFormat::Awq)
+    }
+
+    #[test]
+    fn rankable_path_keeps_penalized_nvfp4_behind_q8_through_calibration() {
+        let models = vec![nvfp4(), q8(), plain_awq()];
+        let ampere = specs("NVIDIA GeForce RTX 3080 Ti", 80.0);
+        let volta = specs("Tesla V100-PCIE-16GB", 80.0);
+
+        let ampere_rankable: Vec<&LlmModel> = rankable_models(&models, &ampere).collect();
+        assert!(ampere_rankable.iter().any(|m| m.name.contains("NVFP4")));
+        assert!(ampere_rankable.iter().any(|m| m.name.contains("GGUF")));
+        // 3080 Ti is Turing-or-newer, so a plain AWQ row is still loadable.
+        assert!(ampere_rankable.iter().any(|m| m.name.contains("AWQ")));
+
+        let volta_rankable: Vec<&LlmModel> = rankable_models(&models, &volta).collect();
+        assert!(
+            volta_rankable.iter().any(|m| m.name.contains("NVFP4")),
+            "compound NVFP4 must not be hidden by the AWQ compute-capability gate"
+        );
+        assert!(
+            volta_rankable.iter().all(|m| !m.name.ends_with("AWQ")),
+            "plain AWQ on V100 stays incompatible"
+        );
+
+        let mut fits: Vec<ModelFit> = ampere_rankable
+            .iter()
+            .map(|m| ModelFit::analyze_with_forced_runtime(m, &ampere, None, None))
+            .collect();
+
+        let nv_pos = fits
+            .iter()
+            .position(|f| f.model.name.contains("NVFP4"))
+            .unwrap();
+        let q8_pos = fits.iter().position(|f| f.best_quant == "Q8_0").unwrap();
+        assert_eq!(fits[q8_pos].runtime, InferenceRuntime::LlamaCpp);
+        assert_eq!(fits[nv_pos].runtime, InferenceRuntime::Vllm);
+        assert_eq!(fits[nv_pos].best_quant, "NVFP4");
+        assert_ne!(fits[nv_pos].fit_level, FitLevel::TooTight);
+        assert_eq!(native_notes(&fits[nv_pos]).len(), 1);
+        assert!(native_notes(&fits[nv_pos])[0].contains("NVFP4"));
+        assert!(native_notes(&fits[nv_pos])[0].contains("native support is absent"));
+        assert!(native_notes(&fits[q8_pos]).is_empty());
+        assert!(fits[q8_pos].score > fits[nv_pos].score);
+        assert!((0.0..=100.0).contains(&fits[nv_pos].score));
+        assert!((0.0..=100.0).contains(&fits[q8_pos].score));
+
+        // Plain AWQ on this Ampere card is unaffected: no native-kernel penalty.
+        let awq_pos = fits
+            .iter()
+            .position(|f| f.model.name.ends_with("AWQ"))
+            .unwrap();
+        assert!(
+            native_notes(&fits[awq_pos]).is_empty(),
+            "{:?}",
+            fits[awq_pos].notes
+        );
+
+        let ranked = crate::fit::rank_models_by_fit(fits.clone());
+        let nv_rank = ranked
+            .iter()
+            .position(|f| f.model.name.contains("NVFP4"))
+            .unwrap();
+        let q8_rank = ranked.iter().position(|f| f.best_quant == "Q8_0").unwrap();
+        assert!(q8_rank < nv_rank);
+
+        // Same model on Blackwell keeps the ordinary score; Ampere is one penalty below.
+        let blackwell = specs("NVIDIA GeForce RTX 5090", 80.0);
+        let ordinary = ModelFit::analyze(&nvfp4(), &blackwell);
+        assert!(
+            ordinary
+                .notes
+                .iter()
+                .any(|n| n.contains("hardware prerequisite is met"))
+        );
+        assert!(
+            (ordinary.score - fits[nv_pos].score - NATIVE_LOW_PRECISION_SCORE_PENALTY).abs() < 0.05,
+            "ordinary {} vs penalized {}",
+            ordinary.score,
+            fits[nv_pos].score
+        );
+
+        let forced = ModelFit::analyze_with_forced_runtime(
+            &nvfp4(),
+            &ampere,
+            None,
+            Some(InferenceRuntime::LlamaCpp),
+        );
+        assert_eq!(forced.runtime, InferenceRuntime::LlamaCpp);
+        assert_eq!(native_notes(&forced).len(), 1);
+        assert!(native_notes(&forced)[0].contains("not a confirmed native path"));
+        assert!((forced.score - fits[nv_pos].score).abs() < 0.05);
+
+        // Calibration rewrites throughput, not the score, and must not apply
+        // the compatibility penalty a second time.
+        let nv_score = fits[nv_pos].score;
+        let nv_notes = fits[nv_pos].notes.clone();
+        let nv_tps = fits[nv_pos].estimated_tps;
+        let q8_score = fits[q8_pos].score;
+        let q8_notes = fits[q8_pos].notes.clone();
+        let q8_tps = fits[q8_pos].estimated_tps;
+        assert!(q8_tps > 0.0);
+        assert!(nv_tps > 0.0);
+        fits[q8_pos].measured_tps = Some(MeasuredTps {
+            tok_s: q8_tps * 0.4,
+            sample_count: 1,
+            hardware_label: "synthetic".to_string(),
+            source: MeasuredSource::LocalBench,
+        });
+        apply_local_calibration(&mut fits);
+
+        assert_eq!(fits[nv_pos].score, nv_score);
+        assert_eq!(fits[nv_pos].notes, nv_notes);
+        assert_eq!(native_notes(&fits[nv_pos]).len(), 1);
+        assert_eq!(fits[q8_pos].score, q8_score);
+        assert_eq!(fits[q8_pos].notes, q8_notes);
+        assert!(native_notes(&fits[q8_pos]).is_empty());
+        let factor = fits[q8_pos]
+            .estimate_basis
+            .local_calibration
+            .expect("calibration factor");
+        assert!((factor - 0.4).abs() < 1e-9);
+        assert!((fits[q8_pos].estimated_tps - q8_tps * 0.4).abs() < 1e-6);
+        // The penalty row is scaled too, and the score is not recomputed from it.
+        assert!((fits[nv_pos].estimated_tps - nv_tps * 0.4).abs() < 1e-6);
+
+        let ranked_after = crate::fit::rank_models_by_fit(fits);
+        let nv_after = ranked_after
+            .iter()
+            .position(|f| f.model.name.contains("NVFP4"))
+            .unwrap();
+        let q8_after = ranked_after
+            .iter()
+            .position(|f| f.best_quant == "Q8_0")
+            .unwrap();
+        assert!(q8_after < nv_after);
+    }
+
+    #[test]
+    fn q6_alternative_ranks_above_nvfp4_on_the_same_pool() {
+        let nv = nvfp4();
+        let gguf = model("acme/Qwen3-8B-Q6-GGUF", "Q6_K", ModelFormat::Gguf);
+        let ctx = gguf.context_length;
+        let q6_mem = gguf.estimate_memory_gb("Q6_K", ctx);
+        let q8_half = gguf.estimate_memory_gb("Q8_0", ctx / 2);
+        let vram = (q6_mem / 0.98 + q8_half) / 2.0;
+        let system = specs("NVIDIA GeForce RTX 3080 Ti", vram);
+        let models = vec![nv, gguf];
+        let rankable: Vec<&LlmModel> = rankable_models(&models, &system).collect();
+        assert_eq!(rankable.len(), 2);
+
+        let fits: Vec<ModelFit> = rankable
+            .iter()
+            .map(|m| ModelFit::analyze_with_forced_runtime(m, &system, None, None))
+            .collect();
+        let ranked = crate::fit::rank_models_by_fit(fits);
+        assert_eq!(ranked[0].best_quant, "Q6_K");
+        assert_eq!(ranked[1].best_quant, "NVFP4");
+        assert!(ranked[0].score > ranked[1].score);
+        assert_eq!(native_notes(&ranked[1]).len(), 1);
+        assert!(native_notes(&ranked[0]).is_empty());
+        assert!((0.0..=100.0).contains(&ranked[0].score));
+        assert!((0.0..=100.0).contains(&ranked[1].score));
+    }
+}

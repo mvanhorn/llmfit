@@ -3374,9 +3374,16 @@ pub fn gpu_compute_capability(name: &str) -> Option<(u8, u8)> {
     None
 }
 
-/// Minimum NVIDIA compute capability required by a quantization format
-/// when running under vLLM. Based on vLLM's documented hardware support:
+/// Minimum NVIDIA compute capability required to *load* a quantization under
+/// vLLM. Based on vLLM's documented hardware support:
 /// <https://docs.vllm.ai/en/latest/features/quantization/#supported-hardware>
+///
+/// This is a loadability gate. Native NVFP4 and FP8 kernels have a separate,
+/// higher hardware prerequisite ([`native_kernel_min_compute_capability`])
+/// that must not be added here: older GPUs may still load those checkpoints
+/// through an unverified fallback, so failing the native threshold is a score
+/// penalty rather than a reason to hide the model. Meeting either number does
+/// not certify that a particular runtime build ships a working kernel.
 ///
 /// Returns `None` for quantization formats that have no known CC restriction
 /// (e.g. GGUF quants which run through llama.cpp, not vLLM).
@@ -3387,6 +3394,33 @@ pub fn quant_min_compute_capability(quantization: &str) -> Option<(u8, u8)> {
         // GPTQ Marlin kernels require Turing+
         "GPTQ-Int4" | "GPTQ-Int8" => Some((7, 5)),
         _ => None,
+    }
+}
+
+/// Which native low-precision kernel a hardware prerequisite refers to.
+///
+/// Not a loadability class. See [`native_kernel_min_compute_capability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeKernelFormat {
+    /// NVFP4 kernels are a Blackwell-class feature (compute capability 10.0).
+    Nvfp4,
+    /// FP8 kernels need Ada, Hopper, or Blackwell (compute capability 8.9).
+    /// Ampere (8.0 / 8.6) is below this line.
+    Fp8,
+}
+
+/// Hardware prerequisite for native low-precision kernels.
+///
+/// This is intentionally separate from [`quant_min_compute_capability`].
+/// That table is the minimum at which vLLM can load AWQ/GPTQ. NVFP4 and FP8
+/// weights can still be *loadable* below the native threshold via an
+/// unverified fallback, so callers must not treat this number as a hard
+/// filter. It is also not runtime certification: a GPU at or above the
+/// threshold only says the architecture is one the kernels require.
+pub fn native_kernel_min_compute_capability(format: NativeKernelFormat) -> (u8, u8) {
+    match format {
+        NativeKernelFormat::Nvfp4 => (10, 0),
+        NativeKernelFormat::Fp8 => (8, 9),
     }
 }
 
@@ -5223,6 +5257,49 @@ GPU[0]          : GFX Version:          gfx1151
         // GGUF quants have no CC restriction
         assert_eq!(super::quant_min_compute_capability("Q4_K_M"), None);
         assert_eq!(super::quant_min_compute_capability("Q8_0"), None);
+    }
+
+    #[test]
+    fn native_kernel_thresholds_are_not_loadability_minimums() {
+        // NVFP4/FP8 stay out of the loadability table. Adding them there would
+        // hard-filter fallback candidates (issue #1084).
+        assert_eq!(super::quant_min_compute_capability("NVFP4"), None);
+        assert_eq!(super::quant_min_compute_capability("FP8"), None);
+        assert_eq!(super::quant_min_compute_capability("nvfp4"), None);
+        assert_eq!(
+            super::native_kernel_min_compute_capability(super::NativeKernelFormat::Nvfp4),
+            (10, 0)
+        );
+        assert_eq!(
+            super::native_kernel_min_compute_capability(super::NativeKernelFormat::Fp8),
+            (8, 9)
+        );
+
+        let ampere = super::gpu_compute_capability("NVIDIA GeForce RTX 3080 Ti").unwrap();
+        assert!(ampere >= super::quant_min_compute_capability("AWQ-4bit").unwrap());
+        assert!(
+            ampere < super::native_kernel_min_compute_capability(super::NativeKernelFormat::Fp8)
+        );
+        assert!(
+            ampere < super::native_kernel_min_compute_capability(super::NativeKernelFormat::Nvfp4)
+        );
+
+        let ada = super::gpu_compute_capability("NVIDIA GeForce RTX 4090").unwrap();
+        assert!(ada >= super::native_kernel_min_compute_capability(super::NativeKernelFormat::Fp8));
+        assert!(
+            ada < super::native_kernel_min_compute_capability(super::NativeKernelFormat::Nvfp4)
+        );
+
+        let hopper = super::gpu_compute_capability("NVIDIA H100 SXM").unwrap();
+        assert!(
+            hopper >= super::native_kernel_min_compute_capability(super::NativeKernelFormat::Fp8)
+        );
+
+        let blackwell = super::gpu_compute_capability("NVIDIA GeForce RTX 5090").unwrap();
+        assert!(
+            blackwell
+                >= super::native_kernel_min_compute_capability(super::NativeKernelFormat::Nvfp4)
+        );
     }
 
     #[test]

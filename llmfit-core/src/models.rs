@@ -19,6 +19,13 @@ pub const TERNARY_QUANT_HIERARCHY: &[&str] = &["I2_S"];
 /// Walking the K-quant ladder would price weights that do not exist.
 pub const MXFP4_QUANT_HIERARCHY: &[&str] = &["MXFP4"];
 
+/// Fixed NVFP4 hierarchy. These checkpoints ship one native kernel format, so
+/// the GGUF K-quant ladder must not be offered as if those files existed.
+pub const NVFP4_QUANT_HIERARCHY: &[&str] = &["NVFP4"];
+
+/// Fixed FP8 hierarchy. Same constraint as [`NVFP4_QUANT_HIERARCHY`].
+pub const FP8_QUANT_HIERARCHY: &[&str] = &["FP8"];
+
 /// ONNX catalog quantization hierarchy (best quality to most compressed).
 pub const ONNX_QUANT_HIERARCHY: &[&str] = &["Q8_0", "Q4_0"];
 
@@ -592,6 +599,55 @@ impl ModelFormat {
     }
 }
 
+/// Native CUDA low-precision weight format.
+///
+/// Distinct from [`ModelFormat`]. AWQ/GPTQ/AutoRound in a compound repo name
+/// name the quantizer, not the kernel that has to execute the weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLowPrecision {
+    Nvfp4,
+    Fp8,
+}
+
+impl NativeLowPrecision {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Nvfp4 => "NVFP4",
+            Self::Fp8 => "FP8",
+        }
+    }
+
+    /// True when `quantization` already names this kernel format, rather than
+    /// a GGUF label or the tool that produced the checkpoint.
+    pub fn named_by_quantization(self, quantization: &str) -> bool {
+        let quant = quantization.to_lowercase();
+        match self {
+            Self::Nvfp4 => has_format_token(&quant, "nvfp4"),
+            Self::Fp8 => has_format_token(&quant, "fp8") || has_format_token(&quant, "float8"),
+        }
+    }
+}
+
+/// `token` as its own separator-delimited piece of an already-lowercased
+/// repo id or quant label (`-`, `_`, `.`, space).
+fn has_format_token(haystack_lower: &str, token: &str) -> bool {
+    haystack_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+/// NVFP4 is checked before FP8 so a compound NVFP4 name cannot be classified
+/// as FP8, and so `nvfp4` is not read as an FP8 token.
+fn claims_native_low_precision(text_lower: &str) -> Option<NativeLowPrecision> {
+    if has_format_token(text_lower, "nvfp4") {
+        Some(NativeLowPrecision::Nvfp4)
+    } else if has_format_token(text_lower, "fp8") || has_format_token(text_lower, "float8") {
+        Some(NativeLowPrecision::Fp8)
+    } else {
+        None
+    }
+}
+
 /// Use-case category for scoring weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum UseCase {
@@ -1050,6 +1106,34 @@ impl LlmModel {
     pub fn is_native_low_precision_named(&self) -> bool {
         let lower = self.name.to_lowercase();
         lower.contains("nvfp4") || lower.contains("mxfp4")
+    }
+
+    /// Native NVFP4 or FP8 kernel format, when this row executes as one.
+    ///
+    /// Metadata (`quantization`) wins over the repo name. NVFP4 wins over an
+    /// AWQ, GPTQ, or AutoRound tool label in a compound name such as
+    /// `Qwen3.8-27B-NVFP4-AWQ-AutoRound` — the tool produced the checkpoint,
+    /// it is not the kernel format (issue #1084). A GGUF repository keeps
+    /// upstream FP8/NVFP4 words from imposing those checkpoint restrictions.
+    /// ONNX, MLX, BitNet, and architecture-native MXFP4 stay on their own paths.
+    pub fn native_low_precision(&self) -> Option<NativeLowPrecision> {
+        if self.format == ModelFormat::Onnx
+            || self.format == ModelFormat::Mlx
+            || self.is_mlx_model()
+            || self.is_ternary_native()
+            || self.is_mxfp4_native()
+        {
+            return None;
+        }
+        let name = self.name.to_lowercase();
+        // GGUF conversions are often named after the upstream checkpoint
+        // (`Base-FP8-GGUF`, `Base-NVFP4-GGUF`). The weights being scored are
+        // GGUF, so the upstream format must not restrict them.
+        if has_format_token(&name, "gguf") {
+            return None;
+        }
+        let quant = self.quantization.to_lowercase();
+        claims_native_low_precision(&quant).or_else(|| claims_native_low_precision(&name))
     }
 
     /// MLX models are Apple-only — they won't run on NVIDIA/AMD/Intel hardware.
@@ -2575,6 +2659,124 @@ mod tests {
         assert!(nvfp4.is_native_low_precision_named());
         assert!(mxfp4.is_native_low_precision_named());
         assert!(!gguf.is_native_low_precision_named());
+    }
+
+    #[test]
+    fn native_low_precision_resolves_compound_nvfp4_ahead_of_awq_tooling() {
+        // The reported repo stacks the kernel format with the quantizer.
+        // AWQ/AutoRound must not override NVFP4.
+        let mut model = sanitization_test_model(
+            "TelperionAI/Qwen3.8-27B-NVFP4-AWQ-AutoRound",
+            "27B",
+            Some(27_000_000_000),
+            16.0,
+        );
+        model.format = ModelFormat::Awq;
+        model.quantization = "AWQ-4bit".to_string();
+        assert_eq!(
+            model.native_low_precision(),
+            Some(NativeLowPrecision::Nvfp4)
+        );
+
+        model.format = ModelFormat::Autoround;
+        model.quantization = "AutoRound-4bit".to_string();
+        assert_eq!(
+            model.native_low_precision(),
+            Some(NativeLowPrecision::Nvfp4)
+        );
+    }
+
+    #[test]
+    fn native_low_precision_reads_metadata_name_and_case() {
+        let mut explicit = sanitization_test_model("acme/plain-weights", "8B", None, 5.0);
+        explicit.format = ModelFormat::Safetensors;
+        explicit.quantization = "NVFP4".to_string();
+        assert_eq!(
+            explicit.native_low_precision(),
+            Some(NativeLowPrecision::Nvfp4)
+        );
+
+        explicit.quantization = "nvfp4".to_string();
+        assert_eq!(
+            explicit.native_low_precision(),
+            Some(NativeLowPrecision::Nvfp4)
+        );
+
+        let mut named = sanitization_test_model("nvidia/Qwen3-8B-NvFp4", "8B", None, 5.0);
+        assert_eq!(
+            named.native_low_precision(),
+            Some(NativeLowPrecision::Nvfp4)
+        );
+        named.name = "nvidia/Qwen3-8B-nvfp4".to_string();
+        assert_eq!(
+            named.native_low_precision(),
+            Some(NativeLowPrecision::Nvfp4)
+        );
+
+        explicit.quantization = "FP8".to_string();
+        explicit.name = "acme/plain-weights".to_string();
+        assert_eq!(
+            explicit.native_low_precision(),
+            Some(NativeLowPrecision::Fp8)
+        );
+        explicit.quantization = "float8".to_string();
+        assert_eq!(
+            explicit.native_low_precision(),
+            Some(NativeLowPrecision::Fp8)
+        );
+
+        // Metadata wins when the name and the quant disagree.
+        explicit.quantization = "FP8".to_string();
+        explicit.name = "acme/somewhere-NVFP4".to_string();
+        assert_eq!(
+            explicit.native_low_precision(),
+            Some(NativeLowPrecision::Fp8)
+        );
+    }
+
+    #[test]
+    fn native_low_precision_ignores_gguf_repos_named_after_the_upstream_checkpoint() {
+        let mut fp8_gguf = sanitization_test_model("unsloth/Qwen3-8B-FP8-GGUF", "8B", None, 5.0);
+        fp8_gguf.quantization = "Q8_0".to_string();
+        assert_eq!(fp8_gguf.native_low_precision(), None);
+
+        let mut nvfp4_gguf =
+            sanitization_test_model("bartowski/Qwen3-8B-NVFP4-GGUF", "8B", None, 5.0);
+        nvfp4_gguf.quantization = "Q4_K_M".to_string();
+        assert_eq!(nvfp4_gguf.native_low_precision(), None);
+
+        // Case of the GGUF marker does not matter, and an explicit upstream
+        // quant string still does not impose the checkpoint restriction.
+        nvfp4_gguf.name = "bartowski/Qwen3-8B-nvfp4-gguf".to_string();
+        nvfp4_gguf.quantization = "NVFP4".to_string();
+        assert_eq!(nvfp4_gguf.native_low_precision(), None);
+    }
+
+    #[test]
+    fn native_low_precision_leaves_awq_mxfp4_mlx_and_onnx_alone() {
+        let mut awq = sanitization_test_model("acme/Qwen3-8B-AWQ", "8B", None, 5.0);
+        awq.format = ModelFormat::Awq;
+        awq.quantization = "AWQ-4bit".to_string();
+        assert_eq!(awq.native_low_precision(), None);
+
+        let mut mxfp4 = sanitization_test_model("openai/gpt-oss-20b", "20B", None, 12.0);
+        mxfp4.architecture = Some("gpt_oss".to_string());
+        mxfp4.quantization = "MXFP4".to_string();
+        assert!(mxfp4.is_mxfp4_native());
+        assert_eq!(mxfp4.native_low_precision(), None);
+
+        let mut mlx =
+            sanitization_test_model("mlx-community/Qwen3-8B-FP8-MLX-4bit", "8B", None, 5.0);
+        mlx.format = ModelFormat::Mlx;
+        assert_eq!(mlx.native_low_precision(), None);
+
+        let mut onnx = sanitization_test_model("onnx-community/Qwen3-8B-FP8", "8B", None, 5.0);
+        onnx.format = ModelFormat::Onnx;
+        assert_eq!(onnx.native_low_precision(), None);
+
+        let mut bitnet = sanitization_test_model("microsoft/bitnet-b1.58-2B-4T", "2B", None, 1.5);
+        bitnet.architecture = Some("bitnet".to_string());
+        assert_eq!(bitnet.native_low_precision(), None);
     }
 
     #[test]

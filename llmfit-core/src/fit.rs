@@ -1,5 +1,5 @@
 use crate::hardware::{GpuBackend, SystemSpecs};
-use crate::models::{self, KvQuant, LlmModel, UseCase};
+use crate::models::{self, KvQuant, LlmModel, NativeLowPrecision, UseCase};
 
 /// Default context window cap used for memory estimation when no explicit
 /// `--max-context` is provided. Most runtimes (llama.cpp, Ollama) default to
@@ -530,7 +530,10 @@ impl ModelFit {
                 rt
             } else if system.cluster_mode {
                 InferenceRuntime::Vllm
-            } else if model.is_prequantized() {
+            } else if model.is_prequantized() || model.native_low_precision().is_some() {
+                // Name-only NVFP4/FP8 rows are not marked prequantized — the
+                // catalog often still says GGUF — but they ship one native
+                // kernel format and do not run as llama.cpp K-quants.
                 InferenceRuntime::Vllm
             } else if system.backend == GpuBackend::Metal && system.unified_memory {
                 InferenceRuntime::Mlx
@@ -686,9 +689,12 @@ impl ModelFit {
             None
         };
 
-        // Dynamic quantization: find best quant that fits
-        // Pre-quantized models (AWQ/GPTQ/AutoRound) have a fixed quantization — skip dynamic selection.
-        let (best_quant, _best_quant_mem) = if model.is_prequantized() {
+        // Dynamic quantization: find best quant that fits.
+        // Pre-quantized models (AWQ/GPTQ/AutoRound) and native NVFP4/FP8
+        // checkpoints have a fixed quantization — skip dynamic selection so a
+        // low-precision repo cannot inherit a synthetic GGUF quant.
+        let native_fmt = model.native_low_precision();
+        let (best_quant, _best_quant_mem) = if model.is_prequantized() || native_fmt.is_some() {
             (model.quantization.as_str(), mem_required)
         } else {
             let budget = mem_available;
@@ -705,7 +711,16 @@ impl ModelFit {
                 })
                 .unwrap_or((model.quantization.as_str(), mem_required))
         };
-        let best_quant_str = if best_quant != model.quantization {
+        let best_quant_str = if let Some(fmt) = native_fmt {
+            // Keep an explicit NVFP4/FP8 quant string. A catalog default such
+            // as Q4_K_M, or an AWQ/AutoRound tool label on a compound NVFP4
+            // repo, is not the kernel format.
+            if fmt.named_by_quantization(best_quant) {
+                best_quant.to_string()
+            } else {
+                fmt.label().to_string()
+            }
+        } else if best_quant != model.quantization {
             notes.push(format!(
                 "Best quantization for hardware: {} (model default: {})",
                 best_quant, model.quantization
@@ -765,6 +780,14 @@ impl ModelFit {
             }
         }
 
+        // Native-kernel compatibility is scored after the runtime and the
+        // execution path are known, and it does not change the memory-fit
+        // verdict. Hardware eligibility is not confirmed runtime support.
+        let native_compat = native_low_precision_compat(model, system, runtime, run_mode);
+        if let Some(note) = native_compat.note {
+            notes.push(note);
+        }
+
         // Multi-dimensional scoring
         let score_components = compute_scores(
             model,
@@ -774,7 +797,10 @@ impl ModelFit {
             mem_required,
             mem_available,
         );
-        let score = weighted_score(score_components, use_case, &config);
+        let mut score = weighted_score(score_components, use_case, &config);
+        if native_compat.penalize {
+            score = apply_native_low_precision_penalty(score);
+        }
 
         if estimated_tps > 0.0 {
             notes.push(format!(
@@ -1110,6 +1136,11 @@ fn moe_memory_for_quant(model: &LlmModel, quant: &str) -> Option<(f64, f64)> {
 fn quant_hierarchy_for(model: &LlmModel, runtime: InferenceRuntime) -> &'static [&'static str] {
     if model.format == models::ModelFormat::Onnx {
         models::ONNX_QUANT_HIERARCHY
+    } else if let Some(format) = model.native_low_precision() {
+        match format {
+            NativeLowPrecision::Nvfp4 => models::NVFP4_QUANT_HIERARCHY,
+            NativeLowPrecision::Fp8 => models::FP8_QUANT_HIERARCHY,
+        }
     } else if runtime == InferenceRuntime::Mlx {
         models::MLX_QUANT_HIERARCHY
     } else if runtime == InferenceRuntime::BitNet {
@@ -1133,7 +1164,10 @@ fn best_quant_for_runtime_budget(
     // callers the model does not fit at all, which is how a 9 GB AWQ model on a
     // 24 GB card ended up labelled "Perfect" alongside an "Insufficient VRAM
     // and system RAM" note.
-    if runtime == InferenceRuntime::Vllm {
+    // Native NVFP4/FP8 is one fixed footprint even when the caller forced a
+    // runtime other than vLLM. Walking the GGUF ladder here would advertise
+    // quants the repo does not ship.
+    if model.native_low_precision().is_some() || runtime == InferenceRuntime::Vllm {
         let required = model.estimate_memory_gb(model.quantization.as_str(), estimation_ctx);
         return (required <= budget).then(|| (model.quantization.clone(), required));
     }
@@ -1150,11 +1184,229 @@ fn best_quant_for_runtime_budget(
         .map(|(quant, required)| (quant.to_string(), required))
 }
 
+/// Composite-score points removed once when native low-precision kernels are
+/// missing or unverified (issue #1084). Not a throughput multiplier: fallback
+/// speed is not known. The result stays inside the composite score's 0-100 range.
+pub(crate) const NATIVE_LOW_PRECISION_SCORE_PENALTY: f64 = 20.0;
+
+fn apply_native_low_precision_penalty(score: f64) -> f64 {
+    (score - NATIVE_LOW_PRECISION_SCORE_PENALTY).clamp(0.0, 100.0)
+}
+
+/// Outcome of the native-kernel check. `note` is `None` when the model is not
+/// NVFP4 or FP8. `penalize` is independent of the memory-fit verdict.
+struct NativeCompat {
+    penalize: bool,
+    note: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeHardware {
+    /// Every participating GPU is a known NVIDIA device at or above the
+    /// native threshold.
+    Eligible,
+    /// At least one participating GPU is known and below the threshold, and
+    /// none are unknown. A stronger card in the same pool does not make the
+    /// set native — placement across the pool is not known.
+    Absent,
+    Unverified(NativeUnverified),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeUnverified {
+    CpuOnly,
+    Cluster,
+    NonCuda,
+    UnknownCapability,
+    NotGpuResident,
+}
+
+fn native_kernel_requirement(format: NativeLowPrecision) -> &'static str {
+    match format {
+        NativeLowPrecision::Nvfp4 => "Blackwell-class NVIDIA GPU (compute capability 10.0+)",
+        NativeLowPrecision::Fp8 => "Ada, Hopper, or Blackwell NVIDIA GPU (compute capability 8.9+)",
+    }
+}
+
+fn modeled_native_runtime(runtime: InferenceRuntime) -> bool {
+    // vLLM is the runtime this scorer models for NVFP4/FP8 kernels. That is
+    // not a claim that the installed build actually has them.
+    runtime == InferenceRuntime::Vllm
+}
+
+/// GPUs that contribute to the selected pool.
+///
+/// An empty `gpus` list is a single-device or synthetic override fixture:
+/// `gpu_name` is the whole set. A non-empty list is authoritative even when
+/// `gpu_name` names only the primary (often the strongest) card.
+fn participating_gpu_names(system: &SystemSpecs) -> Vec<String> {
+    if system.gpus.is_empty() {
+        system.gpu_name.iter().cloned().collect()
+    } else {
+        system.gpus.iter().map(|gpu| gpu.name.clone()).collect()
+    }
+}
+
+fn native_min_cc(format: NativeLowPrecision) -> (u8, u8) {
+    let kind = match format {
+        NativeLowPrecision::Nvfp4 => crate::hardware::NativeKernelFormat::Nvfp4,
+        NativeLowPrecision::Fp8 => crate::hardware::NativeKernelFormat::Fp8,
+    };
+    crate::hardware::native_kernel_min_compute_capability(kind)
+}
+
+fn native_hardware_verdict(
+    format: NativeLowPrecision,
+    system: &SystemSpecs,
+    run_mode: RunMode,
+) -> NativeHardware {
+    // Cluster placement and CPU execution do not inherit CUDA eligibility
+    // from a GPU that happens to be detected on this machine.
+    if system.cluster_mode {
+        return NativeHardware::Unverified(NativeUnverified::Cluster);
+    }
+    if run_mode == RunMode::CpuOnly {
+        return NativeHardware::Unverified(NativeUnverified::CpuOnly);
+    }
+    if !matches!(run_mode, RunMode::Gpu | RunMode::TensorParallel) {
+        return NativeHardware::Unverified(NativeUnverified::NotGpuResident);
+    }
+    if system.backend != GpuBackend::Cuda {
+        return NativeHardware::Unverified(NativeUnverified::NonCuda);
+    }
+
+    let min_cc = native_min_cc(format);
+    let names = participating_gpu_names(system);
+    if names.is_empty() {
+        return NativeHardware::Unverified(NativeUnverified::UnknownCapability);
+    }
+
+    let mut any_unknown = false;
+    let mut any_below = false;
+    let mut any_met = false;
+    for name in &names {
+        match crate::hardware::gpu_compute_capability(name) {
+            Some(cc) if cc >= min_cc => any_met = true,
+            Some(_) => any_below = true,
+            None => any_unknown = true,
+        }
+    }
+    if any_unknown {
+        // Unknown placement stays unverified. It must not be read as native
+        // support, even when another card in the pool would qualify.
+        NativeHardware::Unverified(NativeUnverified::UnknownCapability)
+    } else if any_below {
+        NativeHardware::Absent
+    } else if any_met {
+        NativeHardware::Eligible
+    } else {
+        NativeHardware::Unverified(NativeUnverified::UnknownCapability)
+    }
+}
+
+fn absent_detail(format: NativeLowPrecision, system: &SystemSpecs) -> String {
+    let requirement = native_kernel_requirement(format);
+    let names = participating_gpu_names(system);
+    if names.len() == 1
+        && let Some(cc) = crate::hardware::gpu_compute_capability(&names[0])
+    {
+        format!(
+            "{} is compute capability {}.{}, below {requirement}",
+            names[0], cc.0, cc.1
+        )
+    } else {
+        format!("a participating GPU is below {requirement}, so this set is not all native")
+    }
+}
+
+/// Native-kernel compatibility for one analyzed fit.
+///
+/// Hardware eligibility is not confirmed runtime support. The penalty applies
+/// when native kernels are missing (a known GPU is below the prerequisite) or
+/// unverified (unknown capability or placement, CPU-only, cluster, a non-CUDA
+/// backend, a path that is not GPU-resident, or a runtime other than the one
+/// modeled for this format). Meeting the prerequisite under vLLM keeps the
+/// ordinary score and still does not certify the runtime build.
+fn native_low_precision_compat(
+    model: &LlmModel,
+    system: &SystemSpecs,
+    runtime: InferenceRuntime,
+    run_mode: RunMode,
+) -> NativeCompat {
+    let Some(format) = model.native_low_precision() else {
+        return NativeCompat {
+            penalize: false,
+            note: None,
+        };
+    };
+    let hardware = native_hardware_verdict(format, system, run_mode);
+    let modeled = modeled_native_runtime(runtime);
+    let label = format.label();
+    let requirement = native_kernel_requirement(format);
+
+    let mut note = match hardware {
+        NativeHardware::Eligible if modeled => format!(
+            "{label} hardware prerequisite is met ({requirement}) under {}. Architecture alone does not prove a working runtime.",
+            runtime.label()
+        ),
+        NativeHardware::Eligible => format!(
+            "{label} hardware prerequisite is met ({requirement}), but {} is not a confirmed native path. Fallback execution is possible but unverified. Architecture alone does not prove a working runtime.",
+            runtime.label()
+        ),
+        NativeHardware::Absent => format!(
+            "{label} native support is absent: {}. Fallback execution is possible but unverified.",
+            absent_detail(format, system)
+        ),
+        NativeHardware::Unverified(reason) => {
+            let why = match reason {
+                NativeUnverified::CpuOnly => {
+                    "on CPU-only execution. A detected GPU does not establish native CUDA support and is not treated as native support".to_string()
+                }
+                NativeUnverified::Cluster => {
+                    "for cluster execution: per-node GPU placement is unknown, so a detected GPU is not treated as native support".to_string()
+                }
+                NativeUnverified::NonCuda => format!(
+                    "on {}: native kernels require NVIDIA CUDA, and this backend is not treated as native support",
+                    system.backend.label()
+                ),
+                NativeUnverified::UnknownCapability => {
+                    "because GPU compute capability is unknown and is not treated as native support"
+                        .to_string()
+                }
+                NativeUnverified::NotGpuResident => {
+                    "on this execution path, which is not fully GPU-resident. A detected GPU is not treated as native support".to_string()
+                }
+            };
+            format!(
+                "{label} native support is unverified {why}. Fallback execution is possible but unverified."
+            )
+        }
+    };
+    if !modeled && hardware != NativeHardware::Eligible {
+        note.push_str(&format!(
+            " {} is not a confirmed native path.",
+            runtime.label()
+        ));
+    }
+
+    let penalize = hardware != NativeHardware::Eligible || !modeled;
+    NativeCompat {
+        penalize,
+        note: Some(note),
+    }
+}
+
 pub fn backend_compatible(model: &LlmModel, system: &SystemSpecs) -> bool {
     if model.requires_specialized_runtime() {
         false
     } else if model.is_mlx_model() {
         system.backend == GpuBackend::Metal && system.unified_memory
+    } else if model.native_low_precision().is_some() {
+        // NVFP4/FP8, including compound NVFP4-AWQ-AutoRound names, stay
+        // visible. An AWQ label must not reintroduce the AWQ compute-capability
+        // rejection. Missing native kernels are a note and a score penalty in
+        // `analyze_inner`, not a hard filter, because a fallback may still load.
+        true
     } else if model.is_prequantized() {
         if !matches!(system.backend, GpuBackend::Cuda | GpuBackend::Rocm) {
             return false;
@@ -2175,7 +2427,7 @@ fn weighted_score(sc: ScoreComponents, use_case: UseCase, config: &CalcConfig) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::{GpuBackend, SystemSpecs};
+    use crate::hardware::{GpuBackend, GpuInfo, SystemSpecs};
 
     /// Test helper: default CalcConfig for direct estimate_tps calls.
     fn test_config() -> CalcConfig {
@@ -5483,5 +5735,512 @@ mod tests {
             "expected an ignored-force note, got: {:?}",
             fit.notes
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Native NVFP4 / FP8 kernel compatibility (issue #1084)
+    // ────────────────────────────────────────────────────────────────────
+
+    fn native_notes(fit: &ModelFit) -> Vec<&str> {
+        fit.notes
+            .iter()
+            .filter(|note| {
+                note.contains("native support") || note.contains("hardware prerequisite")
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn assert_bounded_score(fit: &ModelFit) {
+        assert!(
+            (0.0..=100.0).contains(&fit.score),
+            "score {} out of range",
+            fit.score
+        );
+    }
+
+    fn ample_gpu(gpu_name: &str) -> SystemSpecs {
+        test_system_with_gpu(128.0, 80.0, gpu_name)
+    }
+
+    fn with_gpus(primary: &str, names: &[&str]) -> SystemSpecs {
+        let mut system = ample_gpu(primary);
+        system.gpus = names
+            .iter()
+            .map(|name| GpuInfo {
+                name: (*name).to_string(),
+                vram_gb: Some(40.0),
+                backend: GpuBackend::Cuda,
+                count: 1,
+                unified_memory: false,
+                free_vram_gb: None,
+            })
+            .collect();
+        system.gpu_count = names.len() as u32;
+        system
+    }
+
+    fn compound_nvfp4() -> LlmModel {
+        let mut model = test_model("8B", 5.0, Some(5.0));
+        model.name = "TelperionAI/Qwen3.8-27B-NVFP4-AWQ-AutoRound".to_string();
+        model.parameter_count = "8B".to_string();
+        model.format = models::ModelFormat::Awq;
+        model.quantization = "AWQ-4bit".to_string();
+        model
+    }
+
+    fn name_only_nvfp4(name: &str) -> LlmModel {
+        let mut model = test_model("8B", 5.0, Some(5.0));
+        model.name = name.to_string();
+        model.quantization = "Q4_K_M".to_string();
+        model.format = models::ModelFormat::Gguf;
+        model
+    }
+
+    fn fp8_model(quant: &str) -> LlmModel {
+        let mut model = test_model("8B", 5.0, Some(5.0));
+        model.name = "nvidia/Llama-3.1-8B-Instruct-FP8".to_string();
+        model.format = models::ModelFormat::Safetensors;
+        model.quantization = quant.to_string();
+        model
+    }
+
+    #[test]
+    fn native_penalty_is_a_single_clamp_to_the_score_range() {
+        assert_eq!(apply_native_low_precision_penalty(90.1), 70.1);
+        assert_eq!(apply_native_low_precision_penalty(100.0), 80.0);
+        assert_eq!(apply_native_low_precision_penalty(10.0), 0.0);
+        assert_eq!(apply_native_low_precision_penalty(0.0), 0.0);
+        assert_eq!(
+            apply_native_low_precision_penalty(90.0) + NATIVE_LOW_PRECISION_SCORE_PENALTY,
+            90.0
+        );
+    }
+
+    #[test]
+    fn compound_nvfp4_on_ampere_and_volta_loses_the_native_score() {
+        let model = compound_nvfp4();
+        let ampere = ample_gpu("NVIDIA GeForce RTX 3080 Ti");
+        let volta = ample_gpu("Tesla V100-PCIE-16GB");
+        let blackwell = ample_gpu("NVIDIA GeForce RTX 5090");
+
+        // The AWQ tool label must not hide the row before the note/penalty path.
+        assert!(backend_compatible(&model, &ampere));
+        assert!(backend_compatible(&model, &volta));
+
+        let fit_ampere = ModelFit::analyze(&model, &ampere);
+        let fit_volta = ModelFit::analyze(&model, &volta);
+        let fit_blackwell = ModelFit::analyze(&model, &blackwell);
+
+        for fit in [&fit_ampere, &fit_volta, &fit_blackwell] {
+            assert_ne!(fit.fit_level, FitLevel::TooTight);
+            assert_eq!(fit.best_quant, "NVFP4");
+            assert_eq!(fit.runtime, InferenceRuntime::Vllm);
+            assert_bounded_score(fit);
+            assert_eq!(native_notes(fit).len(), 1, "notes: {:?}", fit.notes);
+        }
+        assert_eq!(fit_ampere.fit_level, fit_blackwell.fit_level);
+        assert_eq!(fit_volta.fit_level, fit_blackwell.fit_level);
+
+        for fit in [&fit_ampere, &fit_volta] {
+            let note = native_notes(fit)[0];
+            assert!(note.contains("NVFP4"), "{note}");
+            assert!(note.contains("native support is absent"), "{note}");
+            assert!(
+                note.contains("possible but unverified"),
+                "fallback must stay unverified: {note}"
+            );
+            assert!(!note.contains("hardware prerequisite is met"), "{note}");
+        }
+        assert!(
+            (fit_ampere.score - fit_volta.score).abs() < 0.05,
+            "same penalty on 3080 Ti ({}) and V100 ({})",
+            fit_ampere.score,
+            fit_volta.score
+        );
+        assert!(
+            (fit_blackwell.score - fit_ampere.score - NATIVE_LOW_PRECISION_SCORE_PENALTY).abs()
+                < 0.05,
+            "blackwell {} vs ampere {} should differ by exactly the penalty",
+            fit_blackwell.score,
+            fit_ampere.score
+        );
+        let ok = native_notes(&fit_blackwell)[0];
+        assert!(ok.contains("hardware prerequisite is met"), "{ok}");
+        assert!(ok.contains("does not prove a working runtime"), "{ok}");
+        assert!(!ok.contains("confirmed"), "{ok}");
+        assert!(!ok.contains("possible but unverified"), "{ok}");
+    }
+
+    #[test]
+    fn nvfp4_and_fp8_detection_does_not_restrict_gguf_execution() {
+        let explicit = {
+            let mut model = test_model("8B", 5.0, Some(5.0));
+            model.name = "acme/plain-weights".to_string();
+            model.format = models::ModelFormat::Safetensors;
+            model.quantization = "nvfp4".to_string();
+            model
+        };
+        let named = name_only_nvfp4("nvidia/Qwen3-8B-NvFp4");
+        let named_lower = name_only_nvfp4("nvidia/Qwen3-8B-nvfp4");
+        let fp8 = fp8_model("FP8");
+        let system = ample_gpu("NVIDIA GeForce RTX 5090");
+
+        for model in [&explicit, &named, &named_lower] {
+            let fit = ModelFit::analyze(model, &system);
+            assert_eq!(fit.runtime, InferenceRuntime::Vllm);
+            assert!(
+                fit.best_quant.eq_ignore_ascii_case("nvfp4"),
+                "got {}",
+                fit.best_quant
+            );
+            assert!(
+                !models::is_gguf_quant_label(&fit.best_quant),
+                "synthetic GGUF quant leaked: {}",
+                fit.best_quant
+            );
+            assert_eq!(native_notes(&fit).len(), 1);
+        }
+
+        let fp8_fit = ModelFit::analyze(&fp8, &system);
+        assert_eq!(fp8_fit.best_quant, "FP8");
+        assert!(native_notes(&fp8_fit)[0].contains("FP8"));
+        assert!(native_notes(&fp8_fit)[0].contains("hardware prerequisite is met"));
+
+        // GGUF repos whose *base* name still says FP8 or NVFP4 execute as GGUF.
+        for (name, quant) in [
+            ("unsloth/Qwen3-8B-FP8-GGUF", "Q8_0"),
+            ("bartowski/Qwen3-8B-NVFP4-GGUF", "Q6_K"),
+        ] {
+            let mut model = test_model("8B", 5.0, Some(5.0));
+            model.name = name.to_string();
+            model.quantization = quant.to_string();
+            model.format = models::ModelFormat::Gguf;
+            let fit = ModelFit::analyze(&model, &system);
+            assert_eq!(fit.runtime, InferenceRuntime::LlamaCpp, "{name}");
+            assert!(
+                models::is_gguf_quant_label(&fit.best_quant),
+                "{name} best_quant {}",
+                fit.best_quant
+            );
+            assert!(
+                native_notes(&fit).is_empty(),
+                "{name} inherited a native-kernel note: {:?}",
+                fit.notes
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_ada_and_hopper_meet_the_prerequisite_ampere_does_not() {
+        let model = fp8_model("FP8");
+        let ada = ModelFit::analyze(&model, &ample_gpu("NVIDIA GeForce RTX 4090"));
+        let hopper = ModelFit::analyze(&model, &ample_gpu("NVIDIA H100 SXM"));
+        let ampere = ModelFit::analyze(&model, &ample_gpu("NVIDIA GeForce RTX 3090"));
+
+        for fit in [&ada, &hopper] {
+            let note = native_notes(fit)[0];
+            assert!(note.contains("FP8"), "{note}");
+            assert!(note.contains("hardware prerequisite is met"), "{note}");
+            assert!(!note.contains("confirmed"), "{note}");
+            assert_bounded_score(fit);
+        }
+        assert!((ada.score - hopper.score).abs() < 0.05);
+        let absent = native_notes(&ampere)[0];
+        assert!(absent.contains("FP8"), "{absent}");
+        assert!(absent.contains("native support is absent"), "{absent}");
+        assert!(absent.contains("3090"), "{absent}");
+        assert!(
+            (ada.score - ampere.score - NATIVE_LOW_PRECISION_SCORE_PENALTY).abs() < 0.05,
+            "ada {} vs ampere {}",
+            ada.score,
+            ampere.score
+        );
+
+        // Ada meets FP8 but not NVFP4.
+        let nvfp4 = name_only_nvfp4("nvidia/Qwen3-8B-NVFP4");
+        let ada_nv = ModelFit::analyze(&nvfp4, &ample_gpu("NVIDIA GeForce RTX 4090"));
+        assert!(native_notes(&ada_nv)[0].contains("native support is absent"));
+    }
+
+    #[test]
+    fn forced_unrelated_runtime_is_not_confirmed_native_execution() {
+        let model = name_only_nvfp4("nvidia/Qwen3-8B-NVFP4");
+        let blackwell = ample_gpu("NVIDIA GeForce RTX 5090");
+        let ampere = ample_gpu("NVIDIA GeForce RTX 3080 Ti");
+
+        let auto = ModelFit::analyze(&model, &blackwell);
+        let forced = ModelFit::analyze_with_forced_runtime(
+            &model,
+            &blackwell,
+            None,
+            Some(InferenceRuntime::LlamaCpp),
+        );
+        assert_eq!(forced.runtime, InferenceRuntime::LlamaCpp);
+        assert_eq!(forced.best_quant, "NVFP4");
+        let note = native_notes(&forced)[0];
+        assert!(note.contains("not a confirmed native path"), "{note}");
+        assert!(note.contains("llama.cpp"), "{note}");
+        assert!(note.contains("possible but unverified"), "{note}");
+        assert!(note.contains("does not prove a working runtime"), "{note}");
+        assert!(
+            (auto.score - forced.score - NATIVE_LOW_PRECISION_SCORE_PENALTY).abs() < 0.05,
+            "auto {} vs forced {}",
+            auto.score,
+            forced.score
+        );
+
+        // Forcing vLLM on hardware that already fails the prerequisite does
+        // not stack a second penalty, and it still is not "confirmed".
+        let auto_ampere = ModelFit::analyze(&model, &ampere);
+        let forced_vllm = ModelFit::analyze_with_forced_runtime(
+            &model,
+            &ampere,
+            None,
+            Some(InferenceRuntime::Vllm),
+        );
+        assert_eq!(forced_vllm.runtime, InferenceRuntime::Vllm);
+        assert!((auto_ampere.score - forced_vllm.score).abs() < 0.05);
+        assert_eq!(
+            native_notes(&forced_vllm)
+                .iter()
+                .filter(|note| note.contains("native support is absent"))
+                .count(),
+            1
+        );
+
+        let forced_llama_ampere = ModelFit::analyze_with_forced_runtime(
+            &model,
+            &ampere,
+            None,
+            Some(InferenceRuntime::LlamaCpp),
+        );
+        assert!(
+            native_notes(&forced_llama_ampere)[0].contains("not a confirmed native path"),
+            "{:?}",
+            forced_llama_ampere.notes
+        );
+        assert!((auto_ampere.score - forced_llama_ampere.score).abs() < 0.05);
+    }
+
+    #[test]
+    fn name_only_nvfp4_selects_vllm_and_a_fixed_quant() {
+        let model = name_only_nvfp4("nvidia/Qwen3-8B-NVFP4");
+        let fit = ModelFit::analyze(&model, &ample_gpu("NVIDIA GeForce RTX 3080 Ti"));
+        assert_eq!(fit.runtime, InferenceRuntime::Vllm);
+        assert_eq!(fit.best_quant, "NVFP4");
+        assert!(
+            !fit.notes
+                .iter()
+                .any(|note| note.contains("Best quantization for hardware"))
+        );
+    }
+
+    #[test]
+    fn mxfp4_bitnet_mlx_and_onnx_routing_is_unchanged() {
+        let mut mxfp4 = test_model("20B", 12.0, Some(12.0));
+        mxfp4.name = "openai/gpt-oss-20b".to_string();
+        mxfp4.architecture = Some("gpt_oss".to_string());
+        mxfp4.quantization = "MXFP4".to_string();
+        let cuda = ample_gpu("NVIDIA GeForce RTX 4090");
+        let mx_fit = ModelFit::analyze(&mxfp4, &cuda);
+        assert_eq!(mx_fit.runtime, InferenceRuntime::LlamaCpp);
+        assert_eq!(mx_fit.best_quant, "MXFP4");
+        assert!(native_notes(&mx_fit).is_empty(), "{:?}", mx_fit.notes);
+
+        let mut bitnet = test_model("2.7B", 1.5, Some(1.4));
+        bitnet.name = "microsoft/bitnet-b1.58-2B-4T".to_string();
+        bitnet.architecture = Some("bitnet".to_string());
+        let bit_fit = ModelFit::analyze(&bitnet, &cuda);
+        assert_eq!(bit_fit.runtime, InferenceRuntime::BitNet);
+        assert_eq!(bit_fit.best_quant, "I2_S");
+        assert!(native_notes(&bit_fit).is_empty(), "{:?}", bit_fit.notes);
+
+        let mut mlx = test_model("8B", 5.0, Some(5.0));
+        mlx.name = "mlx-community/Qwen3-8B-FP8-MLX-4bit".to_string();
+        mlx.format = models::ModelFormat::Mlx;
+        let mut metal = test_system(64.0, true, Some(64.0));
+        metal.backend = GpuBackend::Metal;
+        metal.unified_memory = true;
+        metal.gpu_name = Some("Apple M4 Max".to_string());
+        let mlx_fit = ModelFit::analyze(&mlx, &metal);
+        assert_eq!(mlx_fit.runtime, InferenceRuntime::Mlx);
+        assert!(
+            mlx_fit.best_quant.starts_with("mlx-"),
+            "{}",
+            mlx_fit.best_quant
+        );
+        assert!(native_notes(&mlx_fit).is_empty(), "{:?}", mlx_fit.notes);
+
+        let mut onnx = test_model("8B", 5.0, Some(5.0));
+        onnx.name = "onnx-community/Qwen3-8B-FP8".to_string();
+        onnx.format = models::ModelFormat::Onnx;
+        onnx.quantization = "Q8_0".to_string();
+        let onnx_fit = ModelFit::analyze(&onnx, &cuda);
+        assert_eq!(onnx_fit.runtime, InferenceRuntime::LlamaCpp);
+        assert!(
+            models::ONNX_QUANT_HIERARCHY.contains(&onnx_fit.best_quant.as_str()),
+            "{}",
+            onnx_fit.best_quant
+        );
+        assert!(native_notes(&onnx_fit).is_empty(), "{:?}", onnx_fit.notes);
+    }
+
+    #[test]
+    fn q6_and_q8_alternatives_rank_above_non_native_nvfp4() {
+        let nvfp4 = name_only_nvfp4("acme/Qwen3-8B-NVFP4");
+        let mut q8 = test_model("8B", 5.0, Some(5.0));
+        q8.name = "acme/Qwen3-8B-GGUF".to_string();
+        q8.quantization = "Q8_0".to_string();
+
+        let ample = ample_gpu("NVIDIA GeForce RTX 3080 Ti");
+        let nv_fit = ModelFit::analyze(&nvfp4, &ample);
+        let q8_fit = ModelFit::analyze(&q8, &ample);
+        assert_eq!(q8_fit.best_quant, "Q8_0");
+        assert!(native_notes(&q8_fit).is_empty(), "{:?}", q8_fit.notes);
+        assert!(
+            q8_fit.score > nv_fit.score,
+            "q8 {} vs nvfp4 {}",
+            q8_fit.score,
+            nv_fit.score
+        );
+
+        // Budget sits between Q6 and Q8, so the matched GGUF row lands on Q6
+        // and still outranks the penalized NVFP4 candidate.
+        let ctx = nvfp4.context_length;
+        let q6_mem = q8.estimate_memory_gb("Q6_K", ctx);
+        let q8_half = q8.estimate_memory_gb("Q8_0", ctx / 2);
+        let vram = (q6_mem / 0.98 + q8_half) / 2.0;
+        assert!(q6_mem / vram <= 0.98, "q6 {q6_mem} vram {vram}");
+        assert!(q8_half > vram, "q8-half {q8_half} vram {vram}");
+        let mut tight = ample_gpu("NVIDIA GeForce RTX 3080 Ti");
+        tight.gpu_vram_gb = Some(vram);
+        tight.total_gpu_vram_gb = Some(vram);
+
+        let mut q6 = q8.clone();
+        q6.name = "acme/Qwen3-8B-Q6".to_string();
+        q6.quantization = "Q6_K".to_string();
+        let q6_fit = ModelFit::analyze(&q6, &tight);
+        let nv_tight = ModelFit::analyze(&nvfp4, &tight);
+        assert_eq!(q6_fit.best_quant, "Q6_K", "notes: {:?}", q6_fit.notes);
+        assert_ne!(q6_fit.fit_level, FitLevel::TooTight);
+        assert_ne!(nv_tight.fit_level, FitLevel::TooTight);
+        assert!(
+            q6_fit.score > nv_tight.score,
+            "q6 {} vs nvfp4 {}",
+            q6_fit.score,
+            nv_tight.score
+        );
+        let ranked = rank_models_by_fit(vec![nv_tight, q6_fit]);
+        assert_eq!(ranked[0].best_quant, "Q6_K");
+    }
+
+    #[test]
+    fn unknown_cpu_cuda_less_and_mixed_gpus_never_count_as_native() {
+        let model = name_only_nvfp4("nvidia/Qwen3-8B-NVFP4");
+
+        let unknown = ModelFit::analyze(&model, &ample_gpu("Some Random GPU"));
+        let unknown_note = native_notes(&unknown)[0];
+        assert!(
+            unknown_note.contains("native support is unverified"),
+            "{unknown_note}"
+        );
+        assert!(
+            unknown_note.contains("not treated as native support"),
+            "{unknown_note}"
+        );
+        assert!(
+            !unknown_note.contains("hardware prerequisite is met"),
+            "{unknown_note}"
+        );
+        assert_bounded_score(&unknown);
+
+        let mut no_name = ample_gpu("NVIDIA GeForce RTX 5090");
+        no_name.gpu_name = None;
+        no_name.gpus.clear();
+        let empty = ModelFit::analyze(&model, &no_name);
+        assert!(native_notes(&empty)[0].contains("native support is unverified"));
+        assert!(!native_notes(&empty)[0].contains("hardware prerequisite is met"));
+
+        let mut cpu = ample_gpu("NVIDIA GeForce RTX 5090");
+        cpu.gpu_vram_gb = None;
+        cpu.total_gpu_vram_gb = None;
+        let cpu_fit = ModelFit::analyze(&model, &cpu);
+        assert_eq!(cpu_fit.run_mode, RunMode::CpuOnly);
+        let cpu_note = native_notes(&cpu_fit)[0];
+        assert!(cpu_note.contains("CPU-only"), "{cpu_note}");
+        assert!(
+            cpu_note.contains("not treated as native support"),
+            "{cpu_note}"
+        );
+        assert!(
+            !cpu_note.contains("hardware prerequisite is met"),
+            "{cpu_note}"
+        );
+
+        for backend in [GpuBackend::Metal, GpuBackend::Vulkan, GpuBackend::Rocm] {
+            let mut system = ample_gpu("NVIDIA GeForce RTX 5090");
+            system.backend = backend;
+            let fit = ModelFit::analyze(&model, &system);
+            let note = native_notes(&fit)[0];
+            assert!(
+                note.contains("native support is unverified"),
+                "{backend:?}: {note}"
+            );
+            assert!(note.contains(backend.label()), "{backend:?}: {note}");
+            assert!(!note.contains("hardware prerequisite is met"), "{note}");
+        }
+
+        let mut cluster = ample_gpu("NVIDIA GeForce RTX 5090");
+        cluster.cluster_mode = true;
+        cluster.cluster_node_count = 2;
+        cluster.total_gpu_vram_gb = Some(160.0);
+        let cluster_fit = ModelFit::analyze(&model, &cluster);
+        assert_eq!(cluster_fit.runtime, InferenceRuntime::Vllm);
+        let cluster_note = native_notes(&cluster_fit)[0];
+        assert!(cluster_note.contains("cluster"), "{cluster_note}");
+        assert!(
+            cluster_note.contains("not treated as native support"),
+            "{cluster_note}"
+        );
+        assert!(
+            !cluster_note.contains("hardware prerequisite is met"),
+            "{cluster_note}"
+        );
+
+        // Primary name is the Blackwell card. Either order of the pool still
+        // has an Ampere participant, so the set is not all native.
+        for names in [
+            ["NVIDIA GeForce RTX 3080 Ti", "NVIDIA GeForce RTX 5090"],
+            ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 3080 Ti"],
+        ] {
+            let system = with_gpus("NVIDIA GeForce RTX 5090", &names);
+            let fit = ModelFit::analyze(&model, &system);
+            let note = native_notes(&fit)[0];
+            assert!(note.contains("native support is absent"), "{note}");
+            assert!(note.contains("not all native"), "{note}");
+            assert!(!note.contains("hardware prerequisite is met"), "{note}");
+        }
+
+        for names in [
+            ["NVIDIA GeForce RTX 5090", "Some Random GPU"],
+            ["Some Random GPU", "NVIDIA GeForce RTX 5090"],
+        ] {
+            let system = with_gpus("NVIDIA GeForce RTX 5090", &names);
+            let fit = ModelFit::analyze(&model, &system);
+            let note = native_notes(&fit)[0];
+            assert!(note.contains("native support is unverified"), "{note}");
+            assert!(note.contains("not treated as native support"), "{note}");
+            assert!(!note.contains("hardware prerequisite is met"), "{note}");
+        }
+
+        // A lone Blackwell card, whether it comes from gpu_name or gpus, does
+        // meet the hardware prerequisite.
+        let named = ModelFit::analyze(&model, &ample_gpu("NVIDIA GeForce RTX 5090"));
+        assert!(native_notes(&named)[0].contains("hardware prerequisite is met"));
+        let listed = with_gpus("NVIDIA GeForce RTX 5090", &["NVIDIA GeForce RTX 5090"]);
+        let listed_fit = ModelFit::analyze(&model, &listed);
+        assert!(native_notes(&listed_fit)[0].contains("hardware prerequisite is met"));
+        assert!((named.score - listed_fit.score).abs() < 0.05);
     }
 }
